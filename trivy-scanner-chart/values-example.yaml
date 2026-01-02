@@ -1,0 +1,28 @@
+# =============================================================================
+# MINIMAL EXAMPLE - Endast webhook URL krävs
+# =============================================================================
+# Kopiera denna fil till my-values.yaml och fyll i din webhook URL
+# =============================================================================
+
+discord:
+  # REQUIRED: Din Discord webhook URL
+  webhookUrl: "PASTE_YOUR_WEBHOOK_URL_HERE"
+  # Exempel: "https://discord.com/api/webhooks/1234567890/abcdefghijklmnopqrstuvwxyz"
+
+# =============================================================================
+# OPTIONAL: Avancerad konfiguration (ta bort kommentarer för att använda)
+# =============================================================================
+
+# Scanna endast ett specifikt namespace istället för hela klustret
+# scanning:
+#   targetNamespace: "production"  # Endast production namespace
+
+# Ändra när scanningen körs
+# scanning:
+#   schedule: "0 8 * * 1"  # Måndag kl 08:00 UTC (istället för 09:00)
+
+# Minska resurser (om klustret har begränsat minne)
+# resources:
+#   limits:
+#     memory: "2Gi"  # Default är 3Gi
+#     cpu: "500m"    # Default är 1000m

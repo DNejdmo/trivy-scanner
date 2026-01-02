@@ -1,0 +1,18 @@
+apiVersion: v2
+name: trivy-scanner
+description: Combined Kubernetes security scanner (CVE, Secrets, Config, RBAC, CIS) with Discord notifications
+type: application
+version: 1.0.0
+appVersion: "0.57.1"
+keywords:
+  - security
+  - trivy
+  - vulnerability
+  - scanner
+  - cve
+  - secrets
+home: https://github.com/majako/dnejdmo-copilot
+sources:
+  - https://github.com/aquasecurity/trivy
+maintainers:
+  - name: Majako

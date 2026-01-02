@@ -1,0 +1,79 @@
+# =============================================================================
+# Trivy Scanner - Helm Chart Values
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# REQUIRED: Discord Webhook URL
+# -----------------------------------------------------------------------------
+discord:
+  # REQUIRED: Din Discord webhook URL för säkerhetsrapporter
+  webhookUrl: ""
+  # Exempel: "https://discord.com/api/webhooks/1234567890/abcdefghijklmnopqrstuvwxyz"
+
+# -----------------------------------------------------------------------------
+# Scanning Configuration
+# -----------------------------------------------------------------------------
+scanning:
+  # Scanna hela klustret (default) eller endast specifikt namespace
+  # Sätt till "" för att scanna allt, eller ett namespace-namn för att begränsa
+  targetNamespace: ""
+  # Exempel: targetNamespace: "production"  # Endast production namespace
+  
+  # CronJob schema (när scanningen körs)
+  schedule: "0 9 * * 1"  # Varje måndag kl 09:00 UTC
+  
+  # Timeout för varje scanning-steg
+  timeout: "10m"
+
+# -----------------------------------------------------------------------------
+# Trivy Image Configuration
+# -----------------------------------------------------------------------------
+image:
+  repository: aquasec/trivy
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# -----------------------------------------------------------------------------
+# Resource Limits
+# -----------------------------------------------------------------------------
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "250m"
+  limits:
+    memory: "3Gi"
+    cpu: "1000m"
+
+# -----------------------------------------------------------------------------
+# RBAC Configuration
+# -----------------------------------------------------------------------------
+rbac:
+  # Skapa RBAC-resurser automatiskt
+  create: true
+  
+  # ServiceAccount namn
+  serviceAccountName: trivy-scanner
+
+# -----------------------------------------------------------------------------
+# Security Context
+# -----------------------------------------------------------------------------
+securityContext:
+  runAsNonRoot: false  # Trivy behöver root för apk install
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+    add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+
+# -----------------------------------------------------------------------------
+# Job History
+# -----------------------------------------------------------------------------
+jobHistory:
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  backoffLimit: 2

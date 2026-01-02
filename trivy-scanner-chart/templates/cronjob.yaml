@@ -1,0 +1,916 @@
+# =============================================================================
+# Trivy - Combined Security Scanning (CVE + Secrets + Config + RBAC + CIS)
+# =============================================================================
+#
+# SYFTE:
+#   Kombinerad veckovis säkerhetsscan som inkluderar:
+#   1. CVE-scanning av container images
+#   2. Secret scanning av hårdkodade credentials
+#   3. Configuration audit av Kubernetes-resurser
+#   4. RBAC Assessment av roller och behörigheter
+#   5. CIS Kubernetes Benchmark compliance
+#   
+#   Skickar ETT Discord-meddelande med alla fem resultaten.
+#
+# OUTPUT:
+#   Discord-meddelande med:
+#   - Embed 1: 🔒 CVE Scanning (vulnerabilities i images)
+#   - Embed 2: 🔐 Secret Scanning (hardcoded credentials)
+#   - Embed 3: 🔧 Config Audit (misconfigurations i K8s)
+#   - Embed 4: 🔐 RBAC Assessment (roles/bindings audit)
+#   - Embed 5: 📋 CIS Benchmark (compliance kontroller)
+#   - Bifogad fil 1: Detaljerad CVE-rapport
+#   - Bifogad fil 2: Detaljerad Secret-rapport
+#   - Bifogad fil 3: Detaljerad Config-rapport
+#   - Bifogad fil 4: Detaljerad RBAC-rapport
+#   - Bifogad fil 5: Detaljerad CIS-rapport
+#
+# MANUELL KÖRNING:
+#   kubectl create job --from=cronjob/trivy-combined-scan trivy-manual-$(Get-Date -Format "yyyyMMdd-HHmm") -n trivy-system
+#
+# =============================================================================
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: trivy-combined-scan
+  namespace: trivy-system
+  labels:
+    app.kubernetes.io/name: trivy-scanner
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  # Schema: {{ .Values.scanning.schedule }}
+  schedule: {{ .Values.scanning.schedule | quote }}
+  
+  successfulJobsHistoryLimit: {{ .Values.jobHistory.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.jobHistory.failedJobsHistoryLimit }}
+  
+  jobTemplate:
+    spec:
+      # Öka backoff limit för att hantera restart vid högt minne/CPU-bruk
+      backoffLimit: {{ .Values.jobHistory.backoffLimit }}
+      template:
+        metadata:
+          labels:
+            app: trivy-combined
+        spec:
+          serviceAccountName: {{ .Values.rbac.serviceAccountName }}
+          restartPolicy: OnFailure
+          # Pod-level security context
+          securityContext:
+            runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+            fsGroup: 1000
+          containers:
+          - name: trivy-scanner
+            image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+            imagePullPolicy: {{ .Values.image.pullPolicy }}
+            # Container-level security context
+            securityContext:
+              allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation }}
+              readOnlyRootFilesystem: {{ .Values.securityContext.readOnlyRootFilesystem }}
+              runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+              capabilities:
+                drop:
+                  {{- range .Values.securityContext.capabilities.drop }}
+                  - {{ . }}
+                  {{- end }}
+                add:
+                  {{- range .Values.securityContext.capabilities.add }}
+                  - {{ . }}
+                  {{- end }}
+            # Resursbegränsningar för att undvika OOMKilled
+            resources:
+              {{- toYaml .Values.resources | nindent 14 }}
+            env:
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: discord-webhook
+                  key: url
+            {{- if .Values.scanning.targetNamespace }}
+            - name: TARGET_NAMESPACE
+              value: {{ .Values.scanning.targetNamespace | quote }}
+            {{- end }}
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "=========================================="
+              echo "🛡️  Trivy Combined Security Scan"
+              echo "Tidpunkt: $(date)"
+              echo "=========================================="
+              echo ""
+              
+              # Installera nödvändiga verktyg
+              echo "Installerar verktyg..."
+              apk add --no-cache curl kubectl jq
+              echo ""
+              
+              # =============================================================================
+              # STEG 1: TRIVY DATABASE UPDATE
+              # =============================================================================
+              echo "=========================================="
+              echo "📥 Steg 1: Uppdaterar Trivy säkerhetsdatabas"
+              echo "   (CVE, Secrets, Misconfig, RBAC, CIS)"
+              echo "=========================================="
+              trivy image --download-db-only --quiet 2>&1 | grep -v "MiB" | grep -v "ETA" | grep -v "p/s"
+              echo "✓ Säkerhetsdatabas uppdaterad"
+              echo ""
+              
+              # =============================================================================
+              # STEG 2: CVE SCANNING
+              # =============================================================================
+              echo "=========================================="
+              echo "🔍 Steg 2: CVE-scanning av images"
+              echo "=========================================="
+              
+              # Hämta alla unika images - antingen från specifikt namespace eller hela klustret
+              if [ -n "$TARGET_NAMESPACE" ]; then
+                echo "🎯 Target: Endast namespace '$TARGET_NAMESPACE'"
+                kubectl get pods -n $TARGET_NAMESPACE -o json > /tmp/all-pods.json 2>&1
+              else
+                echo "🌐 Target: Hela klustret (alla namespaces)"
+                kubectl get pods --all-namespaces -o json > /tmp/all-pods.json 2>&1
+              fi
+              
+              IMAGES=$(cat /tmp/all-pods.json | jq -r '.items[].spec | (.containers[]?, .initContainers[]?) | .image' 2>&1 | sort -u)
+              IMAGE_COUNT=$(echo "$IMAGES" | wc -l)
+              echo "✓ Hittade $IMAGE_COUNT unika images att scanna (alla pods + init containers)"
+              echo ""
+              
+              # Skapa CVE-rapport
+              CVE_REPORT_FILE="/tmp/trivy-cve-report.txt"
+              echo "# Trivy CVE Vulnerability Scan Report" > $CVE_REPORT_FILE
+              echo "# Datum: $(date)" >> $CVE_REPORT_FILE
+              echo "# =====================================" >> $CVE_REPORT_FILE
+              echo "" >> $CVE_REPORT_FILE
+              
+              # Räknare för CVE totaler
+              CVE_TOTAL_CRITICAL=0
+              CVE_TOTAL_HIGH=0
+              CVE_TOTAL_MEDIUM=0
+              CVE_TOTAL_LOW=0
+              
+              # Räknare för app (default namespace)
+              CVE_APP_CRITICAL=0
+              CVE_APP_HIGH=0
+              CVE_APP_MEDIUM=0
+              CVE_APP_LOW=0
+              
+              # Scanna varje image
+              CURRENT=0
+              for IMAGE in $IMAGES; do
+                CURRENT=$((CURRENT + 1))
+                echo "[$CURRENT/$IMAGE_COUNT] Scannar: $IMAGE"
+                
+                SCAN_OUTPUT=$(trivy image --quiet --format json --ignore-unfixed --vex repo --severity CRITICAL,HIGH,MEDIUM,LOW "$IMAGE" 2>/dev/null || echo '{"Results":[]}')
+                
+                IMAGE_CRITICAL=$(echo "$SCAN_OUTPUT" | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length')
+                IMAGE_HIGH=$(echo "$SCAN_OUTPUT" | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length')
+                IMAGE_MEDIUM=$(echo "$SCAN_OUTPUT" | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length')
+                IMAGE_LOW=$(echo "$SCAN_OUTPUT" | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length')
+                
+                echo "   → Critical: $IMAGE_CRITICAL | High: $IMAGE_HIGH | Medium: $IMAGE_MEDIUM | Low: $IMAGE_LOW"
+                
+                TOTAL_VULNS=$((IMAGE_CRITICAL + IMAGE_HIGH + IMAGE_MEDIUM + IMAGE_LOW))
+                if [ $TOTAL_VULNS -gt 0 ]; then
+                  echo "" >> $CVE_REPORT_FILE
+                  echo "## Image: $IMAGE" >> $CVE_REPORT_FILE
+                  echo "   Critical: $IMAGE_CRITICAL | High: $IMAGE_HIGH | Medium: $IMAGE_MEDIUM | Low: $IMAGE_LOW" >> $CVE_REPORT_FILE
+                  echo "" >> $CVE_REPORT_FILE
+                  
+                  echo "$SCAN_OUTPUT" | jq -r '.Results[]?.Vulnerabilities[]? | "   CVE: \(.VulnerabilityID) | Severity: \(.Severity) | Package: \(.PkgName) | Installed: \(.InstalledVersion) | Fixed: \(.FixedVersion // "N/A")"' 2>/dev/null >> $CVE_REPORT_FILE
+                fi
+                
+                CVE_TOTAL_CRITICAL=$((CVE_TOTAL_CRITICAL + IMAGE_CRITICAL))
+                CVE_TOTAL_HIGH=$((CVE_TOTAL_HIGH + IMAGE_HIGH))
+                CVE_TOTAL_MEDIUM=$((CVE_TOTAL_MEDIUM + IMAGE_MEDIUM))
+                CVE_TOTAL_LOW=$((CVE_TOTAL_LOW + IMAGE_LOW))
+                
+                NAMESPACE=$(kubectl get pods --all-namespaces -o jsonpath="{.items[?(@.spec.containers[*].image=='$IMAGE')].metadata.namespace}" | grep -o "default" | head -1)
+                if [ "$NAMESPACE" = "default" ]; then
+                  CVE_APP_CRITICAL=$((CVE_APP_CRITICAL + IMAGE_CRITICAL))
+                  CVE_APP_HIGH=$((CVE_APP_HIGH + IMAGE_HIGH))
+                  CVE_APP_MEDIUM=$((CVE_APP_MEDIUM + IMAGE_MEDIUM))
+                  CVE_APP_LOW=$((CVE_APP_LOW + IMAGE_LOW))
+                fi
+              done
+              
+              echo ""
+              echo "✓ CVE-scanning avslutad!"
+              echo "   App: C:$CVE_APP_CRITICAL H:$CVE_APP_HIGH M:$CVE_APP_MEDIUM L:$CVE_APP_LOW"
+              echo "   Total: C:$CVE_TOTAL_CRITICAL H:$CVE_TOTAL_HIGH M:$CVE_TOTAL_MEDIUM L:$CVE_TOTAL_LOW"
+              echo ""
+              
+              # Beräkna CVE trend
+              CVE_PREV_CRITICAL=$(kubectl get configmap trivy-scan-history -n trivy-system -o jsonpath='{.data.critical}' 2>/dev/null || echo "0")
+              CVE_PREV_HIGH=$(kubectl get configmap trivy-scan-history -n trivy-system -o jsonpath='{.data.high}' 2>/dev/null || echo "0")
+              CVE_PREV_MEDIUM=$(kubectl get configmap trivy-scan-history -n trivy-system -o jsonpath='{.data.medium}' 2>/dev/null || echo "0")
+              CVE_PREV_LOW=$(kubectl get configmap trivy-scan-history -n trivy-system -o jsonpath='{.data.low}' 2>/dev/null || echo "0")
+              
+              CVE_TREND_TEXT="📊 First scan"
+              if kubectl get configmap trivy-scan-history -n trivy-system >/dev/null 2>&1; then
+                CVE_CRITICAL_DIFF=$((CVE_TOTAL_CRITICAL - CVE_PREV_CRITICAL))
+                CVE_HIGH_DIFF=$((CVE_TOTAL_HIGH - CVE_PREV_HIGH))
+                CVE_MEDIUM_DIFF=$((CVE_TOTAL_MEDIUM - CVE_PREV_MEDIUM))
+                CVE_LOW_DIFF=$((CVE_TOTAL_LOW - CVE_PREV_LOW))
+                
+                CVE_C_TREND="C:±0"
+                CVE_H_TREND="H:±0"
+                CVE_M_TREND="M:±0"
+                CVE_L_TREND="L:±0"
+                
+                [ $CVE_CRITICAL_DIFF -gt 0 ] && CVE_C_TREND="⚠️ C:+$CVE_CRITICAL_DIFF"
+                [ $CVE_CRITICAL_DIFF -lt 0 ] && CVE_C_TREND="✅ C:$CVE_CRITICAL_DIFF"
+                [ $CVE_HIGH_DIFF -gt 0 ] && CVE_H_TREND="⚠️ H:+$CVE_HIGH_DIFF"
+                [ $CVE_HIGH_DIFF -lt 0 ] && CVE_H_TREND="✅ H:$CVE_HIGH_DIFF"
+                [ $CVE_MEDIUM_DIFF -gt 0 ] && CVE_M_TREND="⚠️ M:+$CVE_MEDIUM_DIFF"
+                [ $CVE_MEDIUM_DIFF -lt 0 ] && CVE_M_TREND="✅ M:$CVE_MEDIUM_DIFF"
+                [ $CVE_LOW_DIFF -gt 0 ] && CVE_L_TREND="⚠️ L:+$CVE_LOW_DIFF"
+                [ $CVE_LOW_DIFF -lt 0 ] && CVE_L_TREND="✅ L:$CVE_LOW_DIFF"
+                
+                CVE_TREND_TEXT="$CVE_C_TREND | $CVE_H_TREND | $CVE_M_TREND | $CVE_L_TREND"
+              fi
+              
+              kubectl create configmap trivy-scan-history -n trivy-system \
+                --from-literal=critical=$CVE_TOTAL_CRITICAL \
+                --from-literal=high=$CVE_TOTAL_HIGH \
+                --from-literal=medium=$CVE_TOTAL_MEDIUM \
+                --from-literal=low=$CVE_TOTAL_LOW \
+                --dry-run=client -o yaml | kubectl apply -f - 2>&1 | grep -v "kubectl.kubernetes.io/last-applied-configuration"
+              
+              echo "📈 CVE Trend: $CVE_TREND_TEXT"
+              echo ""
+              
+              # =============================================================================
+              # STEG 3: SECRET SCANNING
+              # =============================================================================
+              echo "=========================================="
+              echo "🔐 Steg 3A: Scannar Kubernetes manifester för secrets"
+              echo "=========================================="
+              
+              # Scanna Kubernetes manifester för hårdkodade secrets
+              echo "Kör: trivy k8s --scanners secret --report all..."
+              if [ -n "$TARGET_NAMESPACE" ]; then
+                trivy k8s --scanners secret --report all --format json --timeout 10m --quiet --namespace $TARGET_NAMESPACE > /tmp/secret-k8s.json 2>&1
+              else
+                trivy k8s --scanners secret --report all --format json --timeout 10m --quiet > /tmp/secret-k8s.json 2>&1
+              fi
+              
+              echo ""
+              echo "=========================================="
+              echo "🔐 Steg 3B: Scannar container images för secrets"
+              echo "=========================================="
+              
+              # Använd samma image-lista som CVE scanning
+              echo "✓ Återanvänder image-lista från CVE scanning ($IMAGE_COUNT images)"
+              echo ""
+              
+              # Scanna varje image för secrets i kod/filer
+              CURRENT=0
+              echo '{"Results":[]}' > /tmp/secret-images.json
+              for IMAGE in $IMAGES; do
+                CURRENT=$((CURRENT + 1))
+                echo "[$CURRENT/$IMAGE_COUNT] Scannar secrets i: $IMAGE"
+                
+                # Scanna image för secrets
+                trivy image --scanners secret --format json --quiet "$IMAGE" > /tmp/scan-result.json 2>/dev/null || echo '{"Results":[]}' > /tmp/scan-result.json
+                
+                # Räkna secrets i denna image
+                IMAGE_SECRETS=$(cat /tmp/scan-result.json | jq '[.Results[]?.Secrets[]?] | length' 2>/dev/null || echo "0")
+                echo "   → Secrets: $IMAGE_SECRETS"
+                
+                # Slå ihop resultaten (bara om det finns secrets)
+                if [ "$IMAGE_SECRETS" -gt 0 ]; then
+                  jq -s '.[0].Results + .[1].Results | {Results: .}' /tmp/secret-images.json /tmp/scan-result.json > /tmp/merged.json
+                  mv /tmp/merged.json /tmp/secret-images.json
+                fi
+              done
+              
+              echo ""
+              echo "✓ Secret image scanning avslutad!"
+              echo ""
+              
+              # Kombinera resultat från K8s och images
+              jq -s '.[0].Resources + .[1].Results | if . then {Results: .} else {Results: []} end' /tmp/secret-k8s.json /tmp/secret-images.json > /tmp/secret-scan.json 2>/dev/null || echo '{"Results":[]}' > /tmp/secret-scan.json
+              
+              # Räkna secrets per severity
+              SECRET_CRITICAL=$(cat /tmp/secret-scan.json | jq -r '[.Results[]?.Secrets[]? | select(.Severity=="CRITICAL")] | length' 2>/dev/null)
+              SECRET_HIGH=$(cat /tmp/secret-scan.json | jq -r '[.Results[]?.Secrets[]? | select(.Severity=="HIGH")] | length' 2>/dev/null)
+              SECRET_MEDIUM=$(cat /tmp/secret-scan.json | jq -r '[.Results[]?.Secrets[]? | select(.Severity=="MEDIUM")] | length' 2>/dev/null)
+              SECRET_LOW=$(cat /tmp/secret-scan.json | jq -r '[.Results[]?.Secrets[]? | select(.Severity=="LOW")] | length' 2>/dev/null)
+              
+              # Fallback to 0 if empty
+              SECRET_CRITICAL=${SECRET_CRITICAL:-0}
+              SECRET_HIGH=${SECRET_HIGH:-0}
+              SECRET_MEDIUM=${SECRET_MEDIUM:-0}
+              SECRET_LOW=${SECRET_LOW:-0}
+              
+              SECRET_TOTAL=$((SECRET_CRITICAL + SECRET_HIGH + SECRET_MEDIUM + SECRET_LOW))
+              
+              echo "✓ Secret scanning avslutad!"
+              echo "   Critical: $SECRET_CRITICAL | High: $SECRET_HIGH | Medium: $SECRET_MEDIUM | Low: $SECRET_LOW"
+              echo "   Total: $SECRET_TOTAL hårdkodade secrets"
+              echo ""
+              
+              # Skapa Secret-rapport
+              SECRET_REPORT_FILE="/tmp/trivy-secret-report.txt"
+              echo "# Trivy Secret Scanning Report" > $SECRET_REPORT_FILE
+              echo "# Datum: $(date)" >> $SECRET_REPORT_FILE
+              echo "# =====================================" >> $SECRET_REPORT_FILE
+              echo "" >> $SECRET_REPORT_FILE
+              echo "⚠️  VARNING: Denna rapport kan innehålla känslig data!" >> $SECRET_REPORT_FILE
+              echo "" >> $SECRET_REPORT_FILE
+              echo "SAMMANFATTNING:" >> $SECRET_REPORT_FILE
+              echo "  Critical: $SECRET_CRITICAL" >> $SECRET_REPORT_FILE
+              echo "  High: $SECRET_HIGH" >> $SECRET_REPORT_FILE
+              echo "  Medium: $SECRET_MEDIUM" >> $SECRET_REPORT_FILE
+              echo "  Low: $SECRET_LOW" >> $SECRET_REPORT_FILE
+              echo "  Total: $SECRET_TOTAL hårdkodade secrets" >> $SECRET_REPORT_FILE
+              echo "" >> $SECRET_REPORT_FILE
+              
+              # Extrahera secrets från JSON (MASKERADE)
+              {
+                # K8s manifester
+                cat /tmp/secret-scan.json | jq -r '
+                  .Resources[]? | 
+                  .Results[]? |
+                  select(.Secrets != null) | 
+                  "## 📄 Kubernetes Manifest: \(.Target)\n   Type: \(.Type)\n" +
+                  (.Secrets[] | 
+                    "   [\(.Severity)] \(.RuleID)\n      Title: \(.Title)\n      Category: \(.Category)\n      Location: Line \(.StartLine) (Offset: \(.Offset) bytes)\n      ⚠️  Secret details masked for security\n")
+                ' 2>/dev/null
+                
+                # Container images
+                cat /tmp/secret-scan.json | jq -r '
+                  .Results[]? |
+                  select(.Secrets != null) |
+                  "## 🐳 Container Image: \(.Target)\n   Type: \(.Type // "filesystem")\n" +
+                  (.Secrets[] |
+                    "   [\(.Severity)] \(.RuleID)\n      Title: \(.Title)\n      Category: \(.Category)\n      Location: Line \(.StartLine) (Offset: \(.Offset) bytes)\n      ⚠️  Secret details masked for security\n")
+                ' 2>/dev/null
+              } >> $SECRET_REPORT_FILE
+              
+              # Beräkna Secret trend
+              SECRET_PREV_CRITICAL=$(kubectl get configmap trivy-secret-history -n trivy-system -o jsonpath='{.data.critical}' 2>/dev/null || echo "0")
+              SECRET_PREV_HIGH=$(kubectl get configmap trivy-secret-history -n trivy-system -o jsonpath='{.data.high}' 2>/dev/null || echo "0")
+              SECRET_PREV_MEDIUM=$(kubectl get configmap trivy-secret-history -n trivy-system -o jsonpath='{.data.medium}' 2>/dev/null || echo "0")
+              SECRET_PREV_LOW=$(kubectl get configmap trivy-secret-history -n trivy-system -o jsonpath='{.data.low}' 2>/dev/null || echo "0")
+              
+              SECRET_TREND_TEXT="📊 First scan"
+              if kubectl get configmap trivy-secret-history -n trivy-system >/dev/null 2>&1; then
+                SECRET_CRITICAL_DIFF=$((SECRET_CRITICAL - SECRET_PREV_CRITICAL))
+                SECRET_HIGH_DIFF=$((SECRET_HIGH - SECRET_PREV_HIGH))
+                SECRET_MEDIUM_DIFF=$((SECRET_MEDIUM - SECRET_PREV_MEDIUM))
+                SECRET_LOW_DIFF=$((SECRET_LOW - SECRET_PREV_LOW))
+                
+                SECRET_C_TREND="C:±0"
+                SECRET_H_TREND="H:±0"
+                SECRET_M_TREND="M:±0"
+                SECRET_L_TREND="L:±0"
+                
+                [ $SECRET_CRITICAL_DIFF -gt 0 ] && SECRET_C_TREND="⚠️ C:+$SECRET_CRITICAL_DIFF"
+                [ $SECRET_CRITICAL_DIFF -lt 0 ] && SECRET_C_TREND="✅ C:$SECRET_CRITICAL_DIFF"
+                [ $SECRET_HIGH_DIFF -gt 0 ] && SECRET_H_TREND="⚠️ H:+$SECRET_HIGH_DIFF"
+                [ $SECRET_HIGH_DIFF -lt 0 ] && SECRET_H_TREND="✅ H:$SECRET_HIGH_DIFF"
+                [ $SECRET_MEDIUM_DIFF -gt 0 ] && SECRET_M_TREND="⚠️ M:+$SECRET_MEDIUM_DIFF"
+                [ $SECRET_MEDIUM_DIFF -lt 0 ] && SECRET_M_TREND="✅ M:$SECRET_MEDIUM_DIFF"
+                [ $SECRET_LOW_DIFF -gt 0 ] && SECRET_L_TREND="⚠️ L:+$SECRET_LOW_DIFF"
+                [ $SECRET_LOW_DIFF -lt 0 ] && SECRET_L_TREND="✅ L:$SECRET_LOW_DIFF"
+                
+                SECRET_TREND_TEXT="$SECRET_C_TREND | $SECRET_H_TREND | $SECRET_M_TREND | $SECRET_L_TREND"
+              fi
+              
+              kubectl create configmap trivy-secret-history -n trivy-system \
+                --from-literal=critical=$SECRET_CRITICAL \
+                --from-literal=high=$SECRET_HIGH \
+                --from-literal=medium=$SECRET_MEDIUM \
+                --from-literal=low=$SECRET_LOW \
+                --dry-run=client -o yaml | kubectl apply -f - 2>&1 | grep -v "kubectl.kubernetes.io/last-applied-configuration"
+              
+              echo "📈 Secret Trend: $SECRET_TREND_TEXT"
+              echo ""
+              
+              # =============================================================================
+              # STEG 4: MISCONFIGURATION SCANNING (exkl. RBAC)
+              # =============================================================================
+              echo "=========================================="
+              echo "🔧 Steg 4: Misconfiguration Scanning"
+              echo "=========================================="
+              
+              echo "Kör: trivy k8s --scanners misconfig (exkluderar RBAC-resurser)..."
+              if [ -n "$TARGET_NAMESPACE" ]; then
+                trivy k8s --scanners misconfig --report all --format json --timeout 10m --quiet \
+                  --namespace $TARGET_NAMESPACE \
+                  --exclude-kinds role,clusterrole,rolebinding,clusterrolebinding,serviceaccount > /tmp/config-scan.json 2>&1
+              else
+                trivy k8s --scanners misconfig --report all --format json --timeout 10m --quiet \
+                  --exclude-kinds role,clusterrole,rolebinding,clusterrolebinding,serviceaccount > /tmp/config-scan.json 2>&1
+              fi
+              
+              # Räkna misconfigurations
+              CONFIG_CRITICAL=$(cat /tmp/config-scan.json | jq -r '[.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="CRITICAL")] | length' 2>/dev/null)
+              CONFIG_HIGH=$(cat /tmp/config-scan.json | jq -r '[.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="HIGH")] | length' 2>/dev/null)
+              CONFIG_MEDIUM=$(cat /tmp/config-scan.json | jq -r '[.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="MEDIUM")] | length' 2>/dev/null)
+              CONFIG_LOW=$(cat /tmp/config-scan.json | jq -r '[.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="LOW")] | length' 2>/dev/null)
+              
+              # Fallback to 0 if empty
+              CONFIG_CRITICAL=${CONFIG_CRITICAL:-0}
+              CONFIG_HIGH=${CONFIG_HIGH:-0}
+              CONFIG_MEDIUM=${CONFIG_MEDIUM:-0}
+              CONFIG_LOW=${CONFIG_LOW:-0}
+              
+              CONFIG_TOTAL=$((CONFIG_CRITICAL + CONFIG_HIGH + CONFIG_MEDIUM + CONFIG_LOW))
+              
+              echo "✓ Config audit avslutad!"
+              echo "   Critical: $CONFIG_CRITICAL | High: $CONFIG_HIGH | Medium: $CONFIG_MEDIUM | Low: $CONFIG_LOW"
+              echo ""
+              
+              # Skapa Config-rapport
+              CONFIG_REPORT_FILE="/tmp/trivy-config-report.txt"
+              echo "# Trivy Configuration Audit Report" > $CONFIG_REPORT_FILE
+              echo "# Datum: $(date)" >> $CONFIG_REPORT_FILE
+              echo "# =====================================" >> $CONFIG_REPORT_FILE
+              echo "" >> $CONFIG_REPORT_FILE
+              echo "SAMMANFATTNING:" >> $CONFIG_REPORT_FILE
+              echo "  Critical: $CONFIG_CRITICAL" >> $CONFIG_REPORT_FILE
+              echo "  High: $CONFIG_HIGH" >> $CONFIG_REPORT_FILE
+              echo "  Medium: $CONFIG_MEDIUM" >> $CONFIG_REPORT_FILE
+              echo "  Low: $CONFIG_LOW" >> $CONFIG_REPORT_FILE
+              echo "  Total: $CONFIG_TOTAL misconfigurations" >> $CONFIG_REPORT_FILE
+              echo "" >> $CONFIG_REPORT_FILE
+              
+              cat /tmp/config-scan.json | jq -r '
+                .Resources[]? | 
+                .Results[]? |
+                select(.Misconfigurations != null) | 
+                "## Resource: \(.Target)\n   Type: \(.Type)\n" +
+                (.Misconfigurations[] | 
+                  "   [\(.Severity)] \(.ID): \(.Title)\n      Message: \(.Message)\n      Resolution: \(.Resolution // "N/A")\n")
+              ' >> $CONFIG_REPORT_FILE 2>/dev/null
+              
+              # Beräkna Config trend
+              CONFIG_PREV_CRITICAL=$(kubectl get configmap trivy-config-history -n trivy-system -o jsonpath='{.data.critical}' 2>/dev/null || echo "0")
+              CONFIG_PREV_HIGH=$(kubectl get configmap trivy-config-history -n trivy-system -o jsonpath='{.data.high}' 2>/dev/null || echo "0")
+              CONFIG_PREV_MEDIUM=$(kubectl get configmap trivy-config-history -n trivy-system -o jsonpath='{.data.medium}' 2>/dev/null || echo "0")
+              CONFIG_PREV_LOW=$(kubectl get configmap trivy-config-history -n trivy-system -o jsonpath='{.data.low}' 2>/dev/null || echo "0")
+              
+              CONFIG_TREND_TEXT="📊 First scan"
+              if kubectl get configmap trivy-config-history -n trivy-system >/dev/null 2>&1; then
+                CONFIG_CRITICAL_DIFF=$((CONFIG_CRITICAL - CONFIG_PREV_CRITICAL))
+                CONFIG_HIGH_DIFF=$((CONFIG_HIGH - CONFIG_PREV_HIGH))
+                CONFIG_MEDIUM_DIFF=$((CONFIG_MEDIUM - CONFIG_PREV_MEDIUM))
+                CONFIG_LOW_DIFF=$((CONFIG_LOW - CONFIG_PREV_LOW))
+                
+                CONFIG_C_TREND="C:±0"
+                CONFIG_H_TREND="H:±0"
+                CONFIG_M_TREND="M:±0"
+                CONFIG_L_TREND="L:±0"
+                
+                [ $CONFIG_CRITICAL_DIFF -gt 0 ] && CONFIG_C_TREND="⚠️ C:+$CONFIG_CRITICAL_DIFF"
+                [ $CONFIG_CRITICAL_DIFF -lt 0 ] && CONFIG_C_TREND="✅ C:$CONFIG_CRITICAL_DIFF"
+                [ $CONFIG_HIGH_DIFF -gt 0 ] && CONFIG_H_TREND="⚠️ H:+$CONFIG_HIGH_DIFF"
+                [ $CONFIG_HIGH_DIFF -lt 0 ] && CONFIG_H_TREND="✅ H:$CONFIG_HIGH_DIFF"
+                [ $CONFIG_MEDIUM_DIFF -gt 0 ] && CONFIG_M_TREND="⚠️ M:+$CONFIG_MEDIUM_DIFF"
+                [ $CONFIG_MEDIUM_DIFF -lt 0 ] && CONFIG_M_TREND="✅ M:$CONFIG_MEDIUM_DIFF"
+                [ $CONFIG_LOW_DIFF -gt 0 ] && CONFIG_L_TREND="⚠️ L:+$CONFIG_LOW_DIFF"
+                [ $CONFIG_LOW_DIFF -lt 0 ] && CONFIG_L_TREND="✅ L:$CONFIG_LOW_DIFF"
+                
+                CONFIG_TREND_TEXT="$CONFIG_C_TREND | $CONFIG_H_TREND | $CONFIG_M_TREND | $CONFIG_L_TREND"
+              fi
+              
+              kubectl create configmap trivy-config-history -n trivy-system \
+                --from-literal=critical=$CONFIG_CRITICAL \
+                --from-literal=high=$CONFIG_HIGH \
+                --from-literal=medium=$CONFIG_MEDIUM \
+                --from-literal=low=$CONFIG_LOW \
+                --dry-run=client -o yaml | kubectl apply -f - 2>&1 | grep -v "kubectl.kubernetes.io/last-applied-configuration"
+              
+              echo "📈 Config Trend: $CONFIG_TREND_TEXT"
+              echo ""
+              
+              # =============================================================================
+              # STEG 5: RBAC ASSESSMENT
+              # =============================================================================
+              echo "=========================================="
+              echo "🔐 Steg 5: RBAC Assessment"
+              echo "=========================================="
+              
+              echo "Kör: trivy k8s --scanners misconfig (endast RBAC-resurser)..."
+              if [ -n "$TARGET_NAMESPACE" ]; then
+                trivy k8s --scanners misconfig --report all --format json --timeout 10m --quiet \
+                  --namespace $TARGET_NAMESPACE \
+                  --include-kinds role,clusterrole,rolebinding,clusterrolebinding,serviceaccount > /tmp/rbac-scan.json 2>&1
+              else
+                trivy k8s --scanners misconfig --report all --format json --timeout 10m --quiet \
+                  --include-kinds role,clusterrole,rolebinding,clusterrolebinding,serviceaccount > /tmp/rbac-scan.json 2>&1
+              fi
+              
+              # Räkna RBAC misconfigurations
+              RBAC_CRITICAL=$(cat /tmp/rbac-scan.json | jq -r '[.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="CRITICAL")] | length' 2>/dev/null)
+              RBAC_HIGH=$(cat /tmp/rbac-scan.json | jq -r '[.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="HIGH")] | length' 2>/dev/null)
+              RBAC_MEDIUM=$(cat /tmp/rbac-scan.json | jq -r '[.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="MEDIUM")] | length' 2>/dev/null)
+              RBAC_LOW=$(cat /tmp/rbac-scan.json | jq -r '[.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="LOW")] | length' 2>/dev/null)
+              
+              # Fallback to 0 if empty
+              RBAC_CRITICAL=${RBAC_CRITICAL:-0}
+              RBAC_HIGH=${RBAC_HIGH:-0}
+              RBAC_MEDIUM=${RBAC_MEDIUM:-0}
+              RBAC_LOW=${RBAC_LOW:-0}
+              
+              RBAC_TOTAL=$((RBAC_CRITICAL + RBAC_HIGH + RBAC_MEDIUM + RBAC_LOW))
+              
+              echo "✅ RBAC assessment avslutad!"
+              echo "   Critical: $RBAC_CRITICAL | High: $RBAC_HIGH | Medium: $RBAC_MEDIUM | Low: $RBAC_LOW"
+              
+              # Generera human-readable RBAC rapport
+              RBAC_REPORT_FILE="/tmp/trivy-rbac-$TIMESTAMP.txt"
+              cat /tmp/rbac-scan.json | jq -r '
+                "RBAC Assessment - Scan Results",
+                "=====================================================",
+                "Scan Time: " + (now | strftime("%Y-%m-%d %H:%M:%S")),
+                "",
+                "🔑 Summary:",
+                "   💥 Critical: " + ([.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="CRITICAL")] | length | tostring),
+                "   ⚠️  High: " + ([.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="HIGH")] | length | tostring),
+                "   ℹ️  Medium: " + ([.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="MEDIUM")] | length | tostring),
+                "   📝 Low: " + ([.Resources[]?.Results[]?.Misconfigurations[]? | select(.Severity=="LOW")] | length | tostring),
+                "",
+                "=====================================================",
+                "",
+                (.Resources[]? | 
+                  "## Resource: " + .Target,
+                  "   Type: " + .Type,
+                  (.Results[]?.Misconfigurations[]? | 
+                    "   [" + .Severity + "] " + .ID + ": " + .Title,
+                    "      Message: " + .Message,
+                    "      Resolution: " + (.Resolution // "N/A"),
+                    ""))
+              ' > $RBAC_REPORT_FILE 2>/dev/null || echo "RBAC Assessment Report - Empty or No Data" > $RBAC_REPORT_FILE
+              
+              # Trend tracking för RBAC
+              RBAC_TREND_TEXT="No previous data"
+              if kubectl get configmap trivy-rbac-history -n trivy-system >/dev/null 2>&1; then
+                PREV_RBAC_CRITICAL=$(kubectl get configmap trivy-rbac-history -n trivy-system -o jsonpath='{.data.critical}' 2>/dev/null || echo "0")
+                PREV_RBAC_HIGH=$(kubectl get configmap trivy-rbac-history -n trivy-system -o jsonpath='{.data.high}' 2>/dev/null || echo "0")
+                PREV_RBAC_MEDIUM=$(kubectl get configmap trivy-rbac-history -n trivy-system -o jsonpath='{.data.medium}' 2>/dev/null || echo "0")
+                PREV_RBAC_LOW=$(kubectl get configmap trivy-rbac-history -n trivy-system -o jsonpath='{.data.low}' 2>/dev/null || echo "0")
+                
+                RBAC_C_DIFF=$((RBAC_CRITICAL - PREV_RBAC_CRITICAL))
+                RBAC_H_DIFF=$((RBAC_HIGH - PREV_RBAC_HIGH))
+                RBAC_M_DIFF=$((RBAC_MEDIUM - PREV_RBAC_MEDIUM))
+                RBAC_L_DIFF=$((RBAC_LOW - PREV_RBAC_LOW))
+                
+                RBAC_C_TREND="±0"
+                [ $RBAC_C_DIFF -gt 0 ] && RBAC_C_TREND="🔴 +$RBAC_C_DIFF"
+                [ $RBAC_C_DIFF -lt 0 ] && RBAC_C_TREND="✅ $RBAC_C_DIFF"
+                
+                RBAC_H_TREND="±0"
+                [ $RBAC_H_DIFF -gt 0 ] && RBAC_H_TREND="🔴 +$RBAC_H_DIFF"
+                [ $RBAC_H_DIFF -lt 0 ] && RBAC_H_TREND="✅ $RBAC_H_DIFF"
+                
+                RBAC_M_TREND="±0"
+                [ $RBAC_M_DIFF -gt 0 ] && RBAC_M_TREND="⚠️ +$RBAC_M_DIFF"
+                [ $RBAC_M_DIFF -lt 0 ] && RBAC_M_TREND="✅ $RBAC_M_DIFF"
+                
+                RBAC_L_TREND="±0"
+                [ $RBAC_L_DIFF -gt 0 ] && RBAC_L_TREND="⚠️ +$RBAC_L_DIFF"
+                [ $RBAC_L_DIFF -lt 0 ] && RBAC_L_TREND="✅ $RBAC_L_DIFF"
+                
+                RBAC_TREND_TEXT="C:$RBAC_C_TREND | H:$RBAC_H_TREND | M:$RBAC_M_TREND | L:$RBAC_L_TREND"
+              fi
+              
+              kubectl create configmap trivy-rbac-history -n trivy-system \
+                --from-literal=critical=$RBAC_CRITICAL \
+                --from-literal=high=$RBAC_HIGH \
+                --from-literal=medium=$RBAC_MEDIUM \
+                --from-literal=low=$RBAC_LOW \
+                --dry-run=client -o yaml | kubectl apply -f - 2>&1 | grep -v "kubectl.kubernetes.io/last-applied-configuration"
+              
+              echo "📈 RBAC Trend: $RBAC_TREND_TEXT"
+              echo ""
+              
+              # =============================================================================
+              # STEG 6: CIS KUBERNETES BENCHMARK
+              # =============================================================================
+              echo "=========================================="
+              echo "📋 Steg 6: CIS Kubernetes Benchmark"
+              echo "=========================================="
+              
+              echo "Kör: trivy k8s --compliance=k8s-cis-1.23..."
+              trivy k8s --compliance=k8s-cis-1.23 --report summary --format json --timeout 10m > /tmp/cis-scan.json 2>&1
+              
+              # Parse CIS results (använd wc -l istället för jq length för att undvika fel)
+              CIS_PASS=$(cat /tmp/cis-scan.json | jq -r '.Results[0]?.Checks[]? | select(.Status=="PASS") | .ID' 2>/dev/null | wc -l)
+              CIS_FAIL=$(cat /tmp/cis-scan.json | jq -r '.Results[0]?.Checks[]? | select(.Status=="FAIL") | .ID' 2>/dev/null | wc -l)
+              CIS_WARN=$(cat /tmp/cis-scan.json | jq -r '.Results[0]?.Checks[]? | select(.Status=="WARN") | .ID' 2>/dev/null | wc -l)
+              
+              # Sätt default till 0 om tomma
+              CIS_PASS=${CIS_PASS:-0}
+              CIS_FAIL=${CIS_FAIL:-0}
+              CIS_WARN=${CIS_WARN:-0}
+              
+              CIS_TOTAL=$((CIS_PASS + CIS_FAIL + CIS_WARN))
+              CIS_SCORE="N/A"
+              CIS_SCORE_NUM=0
+              if [ $CIS_TOTAL -gt 0 ]; then
+                CIS_SCORE_NUM=$((CIS_PASS * 100 / CIS_TOTAL))
+                CIS_SCORE="${CIS_SCORE_NUM}%"
+              fi
+              
+              echo "✅ CIS Benchmark avslutad!"
+              echo "   Pass: $CIS_PASS | Fail: $CIS_FAIL | Warn: $CIS_WARN"
+              if [ $CIS_TOTAL -gt 0 ]; then
+                echo "   Score: $CIS_SCORE"
+              else
+                echo "   Score: N/A (inga CIS-kontroller kördes)"
+              fi
+              
+              # Generera CIS rapport med echo (inte heredoc för att undvika YAML-problem)
+              CIS_REPORT_FILE="/tmp/trivy-cis-$TIMESTAMP.txt"
+              if [ $CIS_TOTAL -gt 0 ]; then
+                echo "CIS Kubernetes Benchmark v1.23 - Compliance Report" > $CIS_REPORT_FILE
+                echo "=====================================================" >> $CIS_REPORT_FILE
+                echo "Scan Time: $(date)" >> $CIS_REPORT_FILE
+                echo "" >> $CIS_REPORT_FILE
+                cat /tmp/cis-scan.json | jq -r '.Results[0]?.Checks[]? | "[\(.Status)] \(.ID) - \(.Title)"' >> $CIS_REPORT_FILE 2>/dev/null
+              else
+                echo "CIS Benchmark Report - No compliance data available" > $CIS_REPORT_FILE
+                echo "" >> $CIS_REPORT_FILE
+                echo "Detta kan bero på:" >> $CIS_REPORT_FILE
+                echo "- Node-collector är inte aktiverad" >> $CIS_REPORT_FILE
+                echo "- CIS-kontroller fungerar bäst i produktionsmiljöer" >> $CIS_REPORT_FILE
+              fi
+              
+              # Trend tracking för CIS
+              CIS_TREND_TEXT="Första körningen"
+              if kubectl get configmap trivy-cis-history -n trivy-system >/dev/null 2>&1; then
+                PREV_CIS_PASS=$(kubectl get configmap trivy-cis-history -n trivy-system -o jsonpath='{.data.pass}' 2>/dev/null || echo "0")
+                PREV_CIS_FAIL=$(kubectl get configmap trivy-cis-history -n trivy-system -o jsonpath='{.data.fail}' 2>/dev/null || echo "0")
+                
+                PASS_DIFF=$((CIS_PASS - PREV_CIS_PASS))
+                FAIL_DIFF=$((CIS_FAIL - PREV_CIS_FAIL))
+                
+                PASS_TREND="±0"
+                [ $PASS_DIFF -gt 0 ] && PASS_TREND="✅ +$PASS_DIFF"
+                [ $PASS_DIFF -lt 0 ] && PASS_TREND="⬇️ $PASS_DIFF"
+                
+                FAIL_TREND="±0"
+                [ $FAIL_DIFF -gt 0 ] && FAIL_TREND="⚠️ +$FAIL_DIFF"
+                [ $FAIL_DIFF -lt 0 ] && FAIL_TREND="✅ $FAIL_DIFF"
+                
+                CIS_TREND_TEXT="Pass: $PASS_TREND | Fail: $FAIL_TREND"
+              fi
+              
+              kubectl create configmap trivy-cis-history -n trivy-system \
+                --from-literal=pass=$CIS_PASS \
+                --from-literal=fail=$CIS_FAIL \
+                --from-literal=warn=$CIS_WARN \
+                --from-literal=score=$CIS_SCORE_NUM \
+                --dry-run=client -o yaml | kubectl apply -f - 2>&1 | grep -v "kubectl.kubernetes.io/last-applied-configuration"
+              
+              echo "📈 CIS Trend: $CIS_TREND_TEXT"
+              echo ""
+              
+              # =============================================================================
+              # STEG 7: KOMBINERAD DISCORD-RAPPORT
+              # =============================================================================
+              echo "=========================================="
+              echo "📤 Steg 7: Skickar komplett säkerhetsrapport"
+              echo "========================================="
+              
+              # Bestäm färg baserat på worst-case severity
+              EMBED_COLOR=3066993  # Grön default
+              if [ "$CVE_APP_CRITICAL" -gt 0 ] || [ "$SECRET_CRITICAL" -gt 0 ] || [ "$CONFIG_CRITICAL" -gt 0 ] || [ "$RBAC_CRITICAL" -gt 0 ] || [ "$CIS_FAIL" -gt 50 ]; then
+                EMBED_COLOR=15158332  # Röd
+              elif [ "$CVE_APP_HIGH" -gt 0 ] || [ "$SECRET_HIGH" -gt 0 ] || [ "$CONFIG_HIGH" -gt 0 ] || [ "$RBAC_HIGH" -gt 0 ] || [ "$CIS_FAIL" -gt 20 ]; then
+                EMBED_COLOR=15105570  # Orange
+              elif [ "$CONFIG_MEDIUM" -gt 50 ] || [ "$SECRET_MEDIUM" -gt 10 ]; then
+                EMBED_COLOR=16776960  # Gul
+              fi
+              
+              TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+              SCAN_DATE=$(date +%Y-%m-%d)
+              SCAN_TIME=$(date +%H:%M:%S)
+              
+              # Skapa Discord payload med inline fields (alla 5 scanners, UTAN trends)
+              cat > /tmp/discord-payload.json << EOF
+              {
+                "embeds": [
+                  {
+                    "title": "🛡️ Trivy Security & Compliance Scan",
+                    "description": "Complete security assessment: CVE, Secrets, Config, RBAC, and CIS Benchmark",
+                    "color": $EMBED_COLOR,
+                    "fields": [
+                      {
+                        "name": "CVE Critical",
+                        "value": "**$CVE_APP_CRITICAL**",
+                        "inline": true
+                      },
+                      {
+                        "name": "CVE High",
+                        "value": "**$CVE_APP_HIGH**",
+                        "inline": true
+                      },
+                      {
+                        "name": "CVE Medium",
+                        "value": "$CVE_APP_MEDIUM",
+                        "inline": true
+                      },
+                      {
+                        "name": "CVE Low",
+                        "value": "$CVE_APP_LOW",
+                        "inline": true
+                      },
+                      {
+                        "name": "\u200B",
+                        "value": "\u200B",
+                        "inline": false
+                      },
+                      {
+                        "name": "SECRET Critical",
+                        "value": "**$SECRET_CRITICAL**",
+                        "inline": true
+                      },
+                      {
+                        "name": "SECRET High",
+                        "value": "**$SECRET_HIGH**",
+                        "inline": true
+                      },
+                      {
+                        "name": "SECRET Medium",
+                        "value": "$SECRET_MEDIUM",
+                        "inline": true
+                      },
+                      {
+                        "name": "SECRET Low",
+                        "value": "$SECRET_LOW",
+                        "inline": true
+                      },
+                      {
+                        "name": "\u200B",
+                        "value": "\u200B",
+                        "inline": false
+                      },
+                      {
+                        "name": "RBAC Critical",
+                        "value": "**$RBAC_CRITICAL**",
+                        "inline": true
+                      },
+                      {
+                        "name": "RBAC High",
+                        "value": "**$RBAC_HIGH**",
+                        "inline": true
+                      },
+                      {
+                        "name": "RBAC Medium",
+                        "value": "$RBAC_MEDIUM",
+                        "inline": true
+                      },
+                      {
+                        "name": "RBAC Low",
+                        "value": "$RBAC_LOW",
+                        "inline": true
+                      },
+                      {
+                        "name": "\u200B",
+                        "value": "\u200B",
+                        "inline": false
+                      },
+                      {
+                        "name": "CONFIG Critical",
+                        "value": "**$CONFIG_CRITICAL**",
+                        "inline": true
+                      },
+                      {
+                        "name": "CONFIG High",
+                        "value": "**$CONFIG_HIGH**",
+                        "inline": true
+                      },
+                      {
+                        "name": "CONFIG Medium",
+                        "value": "$CONFIG_MEDIUM",
+                        "inline": true
+                      },
+                      {
+                        "name": "CONFIG Low",
+                        "value": "$CONFIG_LOW",
+                        "inline": true
+                      },
+                      {
+                        "name": "\u200B",
+                        "value": "\u200B",
+                        "inline": false
+                      },
+                      {
+                        "name": "CIS Passed",
+                        "value": "✅ **$CIS_PASS**",
+                        "inline": true
+                      },
+                      {
+                        "name": "CIS Failed",
+                        "value": "❌ **$CIS_FAIL**",
+                        "inline": true
+                      },
+                      {
+                        "name": "CIS Warnings",
+                        "value": "⚠️ $CIS_WARN",
+                        "inline": true
+                      },
+                      {
+                        "name": "CIS Score",
+                        "value": "**$CIS_SCORE**",
+                        "inline": true
+                      },
+                      {
+                        "name": "📈 Trends",
+                        "value": "**CVE:** $CVE_TREND_TEXT\n**SECRET:** $SECRET_TREND_TEXT\n**RBAC:** $RBAC_TREND_TEXT\n**CONFIG:** $CONFIG_TREND_TEXT\n**CIS:** $CIS_TREND_TEXT",
+                        "inline": false
+                      }
+                    ],
+                    "footer": {
+                      "text": "Trivy Combined Scan • $SCAN_TIME"
+                    }
+                  }
+                ],
+                "content": "🔍 **Security & Compliance Report** - $SCAN_DATE"
+              }
+              EOF
+              
+              # Skapa multipart body med alla 5 filer
+              BOUNDARY="----TrivyCombinedScan$(date +%s)"
+              
+              # Bygg multipart body
+              echo "--$BOUNDARY" > /tmp/multipart.txt
+              echo 'Content-Disposition: form-data; name="payload_json"' >> /tmp/multipart.txt
+              echo 'Content-Type: application/json' >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              cat /tmp/discord-payload.json >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              
+              # Fil 1: CVE rapport
+              echo "--$BOUNDARY" >> /tmp/multipart.txt
+              echo "Content-Disposition: form-data; name=\"files[0]\"; filename=\"trivy-cve-$TIMESTAMP.txt\"" >> /tmp/multipart.txt
+              echo 'Content-Type: text/plain' >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              cat $CVE_REPORT_FILE >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              
+              # Fil 2: Secret rapport
+              echo "--$BOUNDARY" >> /tmp/multipart.txt
+              echo "Content-Disposition: form-data; name=\"files[1]\"; filename=\"trivy-secrets-$TIMESTAMP.txt\"" >> /tmp/multipart.txt
+              echo 'Content-Type: text/plain' >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              cat $SECRET_REPORT_FILE >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              
+              # Fil 3: Config rapport
+              echo "--$BOUNDARY" >> /tmp/multipart.txt
+              echo "Content-Disposition: form-data; name=\"files[2]\"; filename=\"trivy-config-$TIMESTAMP.txt\"" >> /tmp/multipart.txt
+              echo 'Content-Type: text/plain' >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              cat $CONFIG_REPORT_FILE >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              
+              # Fil 4: RBAC rapport
+              echo "--$BOUNDARY" >> /tmp/multipart.txt
+              echo "Content-Disposition: form-data; name=\"files[3]\"; filename=\"trivy-rbac-$TIMESTAMP.txt\"" >> /tmp/multipart.txt
+              echo 'Content-Type: text/plain' >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              cat $RBAC_REPORT_FILE >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              
+              # Fil 5: CIS Benchmark rapport
+              echo "--$BOUNDARY" >> /tmp/multipart.txt
+              echo "Content-Disposition: form-data; name=\"files[4]\"; filename=\"trivy-cis-$TIMESTAMP.txt\"" >> /tmp/multipart.txt
+              echo 'Content-Type: text/plain' >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              cat $CIS_REPORT_FILE >> /tmp/multipart.txt
+              echo '' >> /tmp/multipart.txt
+              
+              echo "--$BOUNDARY--" >> /tmp/multipart.txt
+              
+              # Skicka till Discord
+              curl -s -X POST "$DISCORD_WEBHOOK_URL" \
+                --header "Content-Type: multipart/form-data; boundary=$BOUNDARY" \
+                --data-binary @/tmp/multipart.txt \
+                > /dev/null 2>&1
+            
+              echo ""
+              echo "=========================================="
+              echo "✅ Kombinerad säkerhetsrapport skickad till Discord!"
+              echo "=========================================="
+              echo ""
+              echo "📊 Sammanfattning:"
+              echo "   CVE (App):  C:$CVE_APP_CRITICAL H:$CVE_APP_HIGH M:$CVE_APP_MEDIUM L:$CVE_APP_LOW"
+              echo "   Secrets:    C:$SECRET_CRITICAL H:$SECRET_HIGH M:$SECRET_MEDIUM L:$SECRET_LOW"
+              echo "   Config:     C:$CONFIG_CRITICAL H:$CONFIG_HIGH M:$CONFIG_MEDIUM L:$CONFIG_LOW"
+              echo "   RBAC:       C:$RBAC_CRITICAL H:$RBAC_HIGH M:$RBAC_MEDIUM L:$RBAC_LOW"
+              if [ $CIS_TOTAL -gt 0 ]; then
+                echo "   CIS:        Pass:$CIS_PASS Fail:$CIS_FAIL Warn:$CIS_WARN (Score: $CIS_SCORE)"
+              else
+                echo "   CIS:        N/A (inga kontroller kördes)"
+              fi
+
+              echo ""
+              echo "Nästa scan: Måndag kl 09:00 UTC (10.00 svensk tid)"

@@ -1,0 +1,90 @@
+{{- if .Values.rbac.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.rbac.serviceAccountName }}
+  namespace: trivy-system
+  labels:
+    app.kubernetes.io/name: trivy-scanner
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: trivy-scanner
+  labels:
+    app.kubernetes.io/name: trivy-scanner
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+rules:
+# Läsa workloads för att hitta images
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+  verbs: ["get", "list"]
+# Läsa pods, services, configmaps, secrets för config audit
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets", "namespaces", "serviceaccounts"]
+  verbs: ["get", "list"]
+# Läsa networking resources
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies", "ingresses"]
+  verbs: ["get", "list"]
+# Läsa RBAC resources
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+  verbs: ["get", "list"]
+# Läsa batch jobs
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: trivy-scanner
+  labels:
+    app.kubernetes.io/name: trivy-scanner
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+subjects:
+- kind: ServiceAccount
+  name: {{ .Values.rbac.serviceAccountName }}
+  namespace: trivy-system
+roleRef:
+  kind: ClusterRole
+  name: trivy-scanner
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trivy-configmap-manager
+  namespace: trivy-system
+  labels:
+    app.kubernetes.io/name: trivy-scanner
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["trivy-scan-history", "trivy-config-history", "trivy-secret-history", "trivy-rbac-history", "trivy-cis-history"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: trivy-configmap-manager
+  namespace: trivy-system
+  labels:
+    app.kubernetes.io/name: trivy-scanner
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+subjects:
+- kind: ServiceAccount
+  name: {{ .Values.rbac.serviceAccountName }}
+  namespace: trivy-system
+roleRef:
+  kind: Role
+  name: trivy-configmap-manager
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
