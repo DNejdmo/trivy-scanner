@@ -5,13 +5,13 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 A complete Kubernetes security solution using five automated scanners and sending results to Discord.
-## 🚀 Features
+## Features
 
-- ** CVE Scanning** - Container image vulnerability scanning
-- ** Secret Scanning** - Detects hardcoded secrets and credentials
-- ** Config Audit** - Kubernetes misconfiguration detection
-- ** RBAC Assessment** - Role-based access control analysis
-- ** CIS Benchmark** - Cluster compliance according to CIS standards
+- **CVE Scanning** - Container image vulnerability scanning
+- **Secret Scanning** - Detects hardcoded secrets and credentials
+- **Config Audit** - Kubernetes misconfiguration detection
+- **RBAC Assessment** - Role-based access control analysis
+- **CIS Benchmark** - Cluster compliance according to CIS standards
 
 ##  Quick Install
 
